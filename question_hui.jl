@@ -37,9 +37,10 @@ mutable struct Employe
     qualifications::Vector{Int}
     temps_entree_salle::Float64
     est_occupe::Bool
-    travail_cumule::Float64
+    travail_cumule::Float64      # signal d'équilibrage (recentré au début du régime permanent)
+    travail_stats::Float64       # compteur pur pour les statistiques (jamais modifié sauf reset à 0)
     machine_assignee::Union{Int,Nothing}
-    Employe(id, quals) = new(id, quals, 0.0, false, 0.0, nothing)
+    Employe(id, quals) = new(id, quals, 0.0, false, 0.0, 0.0, nothing)
 end
 
 mutable struct Atelier
@@ -103,42 +104,28 @@ function sortir_salle_attente!(atelier::Atelier, emp_id::Int)
     log_event(atelier, "Employé $emp_id sort de la salle d'attente")
 end
 
+# Redéfinition de la fonction de sélection d'employé (équilibrage de charge)
 function choisir_employe_pour_machine(atelier::Atelier, machine_id::Int)
+    meilleur_id = nothing
+    meilleur_travail = Inf
+    meilleur_entree = Inf
+
     for emp_id in atelier.file_inactifs
         emp = atelier.employes[emp_id]
         if machine_id in emp.qualifications
-            sortir_salle_attente!(atelier, emp_id)
-            return emp_id
-        end
-    end
-    return nothing
-end
-
-function choisir_machine(atelier::Atelier, emp_id::Int, mode_algo::String, mode_choix::String)
-    emp = atelier.employes[emp_id]
-    candidats = Tuple{Int,Produit}[]
-    for m_id in emp.qualifications
-        machine = atelier.machines[m_id]
-        if !machine.occupee && !isempty(machine.file_attente)
-            if mode_choix == "PLUS_TOT_ATELIER"
-                idx = index_produit_doyen(machine.file_attente)
-                doyen = machine.file_attente[idx]
-                push!(candidats, (m_id, doyen))
-            else
-                error("Mode de choix non implémenté : $mode_choix")
+            if emp.travail_cumule < meilleur_travail ||
+               (emp.travail_cumule == meilleur_travail && emp.temps_entree_salle < meilleur_entree)
+                meilleur_id = emp_id
+                meilleur_travail = emp.travail_cumule
+                meilleur_entree = emp.temps_entree_salle
             end
         end
     end
-    isempty(candidats) && return nothing
 
-    if mode_algo == "FIFO_ATELIER"
-        sort!(candidats, by = x -> x[2].arrivee_atelier)
-    else
-        error("Algorithme non implémenté : $mode_algo")
+    if meilleur_id !== nothing
+        sortir_salle_attente!(atelier, meilleur_id)
     end
-    choix = candidats[1][1]
-    log_event(atelier, "Employé $emp_id choisit la machine $choix (algo=$mode_algo, choix=$mode_choix)")
-    return choix
+    return meilleur_id
 end
 
 function arriver_sur_machine!(atelier::Atelier, p::Produit, m_id::Int, temps::Float64)
@@ -166,10 +153,82 @@ function arriver_sur_machine!(atelier::Atelier, p::Produit, m_id::Int, temps::Fl
     return nothing
 end
 
-# --- PROCESSUS (avec enregistrement historique si activé) ---
+# Fonction de calcul du score PT+WINQ
+function calculer_pt_winq(atelier::Atelier, p::Produit, m_id::Int)
+    # PT : Espérance du temps sur la machine actuelle
+    a, b = TEMPS[(p.type, m_id)]
+    pt = (a + b) / 2.0
+    
+    # WINQ : Charge de travail déjà en attente sur la PROCHAINE machine
+    winq = 0.0
+    if p.etape < length(PARCOURS[p.type])
+        next_m_id = PARCOURS[p.type][p.etape + 1]
+        next_machine = atelier.machines[next_m_id]
+        
+        for p_attente in next_machine.file_attente
+            a_next, b_next = TEMPS[(p_attente.type, next_m_id)]
+            winq += (a_next + b_next) / 2.0
+        end
+    end
+    
+    return pt + winq
+end
 
-@resumable function processus_employe(sim::Simulation, emp_id::Int, atelier::Atelier, 
-                                      mode_algo::String, mode_choix::String)
+# Trouver le produit avec le meilleur score PT+WINQ dans une file
+function index_produit_pt_winq(atelier::Atelier, machine::Machine, m_id::Int)
+    isempty(machine.file_attente) && return nothing
+    idx_min = 1
+    val_min = calculer_pt_winq(atelier, machine.file_attente[1], m_id)
+    
+    for i in 2:length(machine.file_attente)
+        val = calculer_pt_winq(atelier, machine.file_attente[i], m_id)
+        if val < val_min
+            val_min = val
+            idx_min = i
+        # Départage avec la règle FIFO classique en cas d'égalité
+        elseif val == val_min && machine.file_attente[i].arrivee_atelier < machine.file_attente[idx_min].arrivee_atelier
+            idx_min = i 
+        end
+    end
+    return idx_min
+end
+
+function choisir_machine(atelier::Atelier, emp_id::Int, mode_algo::String, mode_choix::String)
+    emp = atelier.employes[emp_id]
+    candidats = Tuple{Int,Produit,Float64}[]
+    
+    for m_id in emp.qualifications
+        machine = atelier.machines[m_id]
+        if !machine.occupee && !isempty(machine.file_attente)
+            if mode_choix == "PLUS_TOT_ATELIER"
+                idx = index_produit_doyen(machine.file_attente)
+                score = machine.file_attente[idx].arrivee_atelier
+            elseif mode_choix == "PT_WINQ"
+                idx = index_produit_pt_winq(atelier, machine, m_id)
+                score = calculer_pt_winq(atelier, machine.file_attente[idx], m_id)
+            else
+                error("Mode de choix non implémenté : $mode_choix")
+            end
+            push!(candidats, (m_id, machine.file_attente[idx], score))
+        end
+    end
+
+    isempty(candidats) && return nothing
+
+    if mode_algo == "FIFO_ATELIER"
+        sort!(candidats, by = x -> x[2].arrivee_atelier)
+    elseif mode_algo == "PT_WINQ"
+        sort!(candidats, by = x -> x[3])
+    else
+        error("Algorithme non implémenté : $mode_algo")
+    end
+
+    choix = candidats[1][1]
+    log_event(atelier, "Employé $emp_id choisit la machine $choix (algo=$mode_algo, choix=$mode_choix)")
+    return choix
+end
+
+@resumable function processus_employe(sim::Simulation, emp_id::Int, atelier::Atelier, mode_algo::String, mode_choix::String)
     emp = atelier.employes[emp_id]
     while true
         if !emp.est_occupe
@@ -178,21 +237,48 @@ end
                 machine = atelier.machines[m_id]
                 machine.occupee = true
                 emp.est_occupe = true
-                idx_doyen = index_produit_doyen(machine.file_attente)
-                p = machine.file_attente[idx_doyen]
-                deleteat!(machine.file_attente, idx_doyen)
+                
+                if mode_choix == "PLUS_TOT_ATELIER"
+                    idx_produit = index_produit_doyen(machine.file_attente)
+                elseif mode_choix == "PT_WINQ"
+                    idx_produit = index_produit_pt_winq(atelier, machine, m_id)
+                else
+                    idx_produit = 1
+                end
+                
+                p = machine.file_attente[idx_produit]
+                deleteat!(machine.file_attente, idx_produit)
                 machine.en_service = p
                 emp.machine_assignee = nothing
                 duree = rand(Uniform(TEMPS[(p.type, m_id)]...))
+                debut_tache = now(sim)
                 log_event(atelier, "Employé $emp_id commence service sur machine $m_id pour produit $(p.id) (durée=$(round(duree,digits=3)))")
+                
                 @yield timeout(sim, duree)
+                
                 if now(sim) >= atelier.fin_transitoire
-                    emp.travail_cumule += duree
+                    portion_permanente = now(sim) - max(debut_tache, atelier.fin_transitoire)
+                    emp.travail_cumule += portion_permanente
+                    emp.travail_stats  += portion_permanente
                 end
+                
                 machine.en_service = nothing
                 machine.occupee = false
                 emp.est_occupe = false
                 log_event(atelier, "Employé $emp_id termine service sur machine $m_id")
+
+                if !isempty(machine.file_attente)
+                    employe_de_remplacement = choisir_employe_pour_machine(atelier, m_id)
+                    if employe_de_remplacement !== nothing
+                        machine.occupee = true
+                        atelier.employes[employe_de_remplacement].machine_assignee = m_id
+                        ev = atelier.events_employes[employe_de_remplacement]
+                        if state(ev) == SimJulia.idle
+                            succeed(ev)
+                        end
+                    end
+                end
+                
                 p.etape += 1
                 if p.etape <= length(PARCOURS[p.type])
                     m_suiv = PARCOURS[p.type][p.etape]
@@ -218,24 +304,61 @@ end
             atelier.events_employes[emp_id] = Event(sim)
             ev = atelier.events_employes[emp_id]
             log_event(atelier, "Employé $emp_id attend un événement (salle d'attente)")
+            
             @yield ev
+            
             m_id = emp.machine_assignee
             emp.machine_assignee = nothing
             if m_id === nothing
                 error("Employé $emp_id réveillé sans machine assignée")
             end
+            
             machine = atelier.machines[m_id]
-            p = machine.en_service
-            duree = rand(Uniform(TEMPS[(p.type, m_id)]...))
-            log_event(atelier, "Employé $emp_id réveillé, commence service sur machine $m_id pour produit $(p.id) (durée=$(round(duree,digits=3)))")
-            @yield timeout(sim, duree)
-            if now(sim) >= atelier.fin_transitoire
-                emp.travail_cumule += duree
+            
+            if machine.en_service === nothing
+                if mode_choix == "PLUS_TOT_ATELIER"
+                    idx_produit = index_produit_doyen(machine.file_attente)
+                elseif mode_choix == "PT_WINQ"
+                    idx_produit = index_produit_pt_winq(atelier, machine, m_id)
+                else
+                    idx_produit = 1
+                end
+                p = machine.file_attente[idx_produit]
+                deleteat!(machine.file_attente, idx_produit)
+                machine.en_service = p
+            else
+                p = machine.en_service
             end
+            
+            duree = rand(Uniform(TEMPS[(p.type, m_id)]...))
+            debut_tache = now(sim)
+            log_event(atelier, "Employé $emp_id réveillé, commence service sur machine $m_id pour produit $(p.id) (durée=$(round(duree,digits=3)))")
+
+            @yield timeout(sim, duree)
+            
+            if now(sim) >= atelier.fin_transitoire
+                portion_permanente = now(sim) - max(debut_tache, atelier.fin_transitoire)
+                emp.travail_cumule += portion_permanente
+                emp.travail_stats  += portion_permanente
+            end
+            
             machine.en_service = nothing
             machine.occupee = false
             emp.est_occupe = false
             log_event(atelier, "Employé $emp_id termine service sur machine $m_id")
+
+            if !isempty(machine.file_attente)
+                employe_de_remplacement = choisir_employe_pour_machine(atelier, m_id)
+                if employe_de_remplacement !== nothing
+                    machine.occupee = true
+                    atelier.employes[employe_de_remplacement].machine_assignee = m_id
+                    ev = atelier.events_employes[employe_de_remplacement]
+                    if state(ev) == SimJulia.idle
+                        succeed(ev)
+                    end
+                end
+            end
+            
             p.etape += 1
             if p.etape <= length(PARCOURS[p.type])
                 m_suiv = PARCOURS[p.type][p.etape]
@@ -272,22 +395,24 @@ end
 @resumable function processus_reinitialisation(sim::Simulation, atelier::Atelier, duree_transient::Float64)
     @yield timeout(sim, duree_transient)
     log_event(atelier, "=== FIN PÉRIODE TRANSITOIRE (t=$duree_transient) - RÉINITIALISATION STATISTIQUES ===")
+    moyenne_transitoire = mean([emp.travail_cumule for emp in atelier.employes])
     for emp in atelier.employes
-        emp.travail_cumule = 0.0
+        emp.travail_cumule = emp.travail_cumule - moyenne_transitoire  # signal recentré
+        emp.travail_stats = 0.0                                         # compteur propre
     end
 end
 
 # --- FONCTION DE SIMULATION AVEC OPTION GRAPHIQUE ---
 
 function etude_performance(Q, label, mode_algo="FIFO_ATELIER", mode_choix="PLUS_TOT_ATELIER", 
-                           n_runs=20, duree_transient=10000.0, duree_permanent=1000.0;
+                           n_runs=20, duree_transient=10000.0, duree_permanent=2000.0;
                            verbose=false, plot_convergence=false)
     sejours_moyens = Float64[]
     nb_emp = size(Q, 1)
     occupations = [Float64[] for _ in 1:nb_emp]
 
     for r in 1:n_runs
-        record_this_run = plot_convergence && (r == 1)   # seulement le premier run si demandé
+        record_this_run = plot_convergence && (r == 1)
         verbose && println("\n--- RUN $r ---")
         sim = Simulation()
         atelier = Atelier(sim, Q, verbose, record_this_run)
@@ -308,15 +433,13 @@ function etude_performance(Q, label, mode_algo="FIFO_ATELIER", mode_choix="PLUS_
             push!(sejours_moyens, mean(atelier.temps_sejour))
         end
         for i in 1:nb_emp
-            push!(occupations[i], atelier.employes[i].travail_cumule / duree_permanent * 100)
+            push!(occupations[i], atelier.employes[i].travail_stats / duree_permanent * 100)
         end
         verbose && println("Fin run $r : produits terminés en phase permanente = $(length(atelier.temps_sejour))")
 
-        # --- Tracé pour le premier run si demandé ---
         if record_this_run && !isempty(atelier.temps_sejour_history)
-            # Calculer la moyenne cumulée
             history = atelier.temps_sejour_history
-            sort!(history, by = x -> x[1])  # tri par temps de fin
+            sort!(history, by = x -> x[1])
             temps = [t for (t, _) in history]
             sejours = [s for (_, s) in history]
             cum_mean = cumsum(sejours) ./ (1:length(sejours))
@@ -342,19 +465,16 @@ function etude_performance(Q, label, mode_algo="FIFO_ATELIER", mode_choix="PLUS_
     @printf(" > Occupation employés : %s\n", join([@sprintf("%.1f%%", x) for x in occ_moy], ", "))
 end
 
-# --- EXÉCUTION AVEC GRAPHIQUES ---
+
 Q1 = [1 1 0 0 0 0 0 0; 0 0 1 1 0 0 0 0; 0 0 0 0 1 1 0 0; 0 0 0 0 0 0 1 1]
 Q2 = [1 0 1 0 0 1 0 0; 0 1 0 0 1 0 1 1; 0 1 0 1 1 0 0 1; 1 0 1 1 0 1 1 0]
 Q3 = [1 1 0 0 0 0 0 0; 0 0 1 0 0 0 0 0; 0 0 0 1 0 1 0 0; 0 0 0 0 1 0 0 1; 0 0 1 0 0 1 0 0; 1 0 0 0 0 0 1 0]
 Q4 = [1 1 1 0 0 0 0 0; 0 0 0 1 1 1 0 0; 1 0 1 0 0 1 1 1; 0 0 1 0 1 0 1 1; 0 1 0 0 0 1 1 0; 1 0 0 1 0 0 1 1]
 
 Random.seed!(123)
-println("LANCEMENT DE L'ÉTUDE COMPARATIVE AVEC GRAPHIQUES DE CONVERGENCE")
+println("Résulats:")
 
-# Attention, verbose:true affiche tous les événements ; à n'utiliser que sur des simulations très très courtes 
-# Utile essentiellement pour débuguer
-
-etude_performance(Q1, "I1", "FIFO_ATELIER", "PLUS_TOT_ATELIER", verbose=false, plot_convergence=false)
-etude_performance(Q2, "I2", "FIFO_ATELIER", "PLUS_TOT_ATELIER", verbose=false, plot_convergence=false)
-etude_performance(Q3, "I3", "FIFO_ATELIER", "PLUS_TOT_ATELIER", verbose=false, plot_convergence=false)
-etude_performance(Q4, "I4", "FIFO_ATELIER", "PLUS_TOT_ATELIER", verbose=false, plot_convergence=false)
+etude_performance(Q1, "I1", "PT_WINQ", "PT_WINQ", verbose=false, plot_convergence=true)
+etude_performance(Q2, "I2", "PT_WINQ", "PT_WINQ", verbose=false, plot_convergence=true)
+etude_performance(Q3, "I3", "PT_WINQ", "PT_WINQ", verbose=false, plot_convergence=true)
+etude_performance(Q4, "I4", "PT_WINQ", "PT_WINQ", verbose=false, plot_convergence=true)

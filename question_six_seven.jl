@@ -1,3 +1,5 @@
+include("simulate_prof.jl")
+
 # Fonction de calcul du score PT+WINQ
 function calculer_pt_winq(atelier::Atelier, p::Produit, m_id::Int)
     # PT : Espérance du temps sur la machine actuelle

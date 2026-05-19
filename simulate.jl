@@ -133,7 +133,7 @@ function fifo_algo(state::SimState, emp_id::Int)::Tuple{Int,Int}
             if t_arr < earliest
                 earliest  = t_arr
                 best_mach = mach
-                best_qi   = 1
+                best_qi   = 1     # C'est redondant mais on comprend que c'est la première (on aurait pu renvoyer 1)
             end
         end
     end
@@ -255,7 +255,6 @@ function run_simulation(
     ss_window::Int       = 30,
     ss_rel_tol::Float64  = 0.01,
     ss_n_stable::Int     = 3,
-    verbose::Bool        = true
 )
     Random.seed!(seed)
     env   = Simulation()
@@ -270,23 +269,13 @@ function run_simulation(
     for emp_id in 1:state.n_emp
         @process employee_process(env, state, emp_id)
     end
-
-    if verbose
-        println("  Starting simulation...")
-    end
     
     # On run
-    t_sim_start = time()
     run(env, time_limit)
-    t_sim_elapsed = time() - t_sim_start
-    
-    if verbose
-        @printf("  Simulation complete in %.2f seconds\n", t_sim_elapsed)
-        println("  Processing results...")
-    end
 
     # On extrait les temps de sejour pour detecter l'etat stationnaire et calculer les indicateurs.
-    sejourn_values = [s for (_, s) in state.sejourn_records]
+    valid_records  = filter(r -> r[1] <= time_limit, state.sejourn_records)
+    sejourn_values = [s for (_, s) in valid_records]
 
     # Etat stationnaire
     ss_idx = detect_steady_state_index(
@@ -297,17 +286,6 @@ function run_simulation(
     )
 
     ss_time = state.sejourn_records[ss_idx][1]
-
-    if verbose
-        n_total = length(sejourn_values)
-        n_ss    = n_total - ss_idx + 1
-        if ss_idx == 1
-            println("  [!] Regime permanent non detecte — toute la simulation est utilisee.")
-        else
-            @printf("  [ok] Regime permanent detecte a t = %.2f  (%d produits sur %d)\n",
-                    ss_time, n_ss, n_total)
-        end
-    end
 
     # Indicateurs
     ss_sejourns  = sejourn_values[ss_idx:end]
@@ -347,19 +325,19 @@ function main()
     TIME_LIMIT = 500000.0
 
     println("--- Instance I1 ---")
-    res_I1 = run_simulation(QI1; time_limit=TIME_LIMIT, seed=1, verbose=true)
+    res_I1 = run_simulation(QI1; time_limit=TIME_LIMIT, seed=1)
     print_results("I1 (q=4, specialise)", res_I1)
 
     println("--- Instance I2 ---")
-    res_I2 = run_simulation(QI2; time_limit=TIME_LIMIT, seed=2, verbose=true)
+    res_I2 = run_simulation(QI2; time_limit=TIME_LIMIT, seed=2)
     print_results("I2 (q=4, polyvalent)", res_I2)
 
     println("--- Instance I3 ---")
-    res_I3 = run_simulation(QI3; time_limit=TIME_LIMIT, seed=3, verbose=true)
+    res_I3 = run_simulation(QI3; time_limit=TIME_LIMIT, seed=3)
     print_results("I3 (q=6, specialise)", res_I3)
 
     println("--- Instance I4 ---")
-    res_I4 = run_simulation(QI4; time_limit=TIME_LIMIT, seed=4, verbose=true)
+    res_I4 = run_simulation(QI4; time_limit=TIME_LIMIT, seed=4 )
     print_results("I4 (q=6, polyvalent)", res_I4)
 end
 
